@@ -8,106 +8,99 @@
 import Foundation
 import SwiftUI
 import PhotosUI
+import AVFoundation
 import UniformTypeIdentifiers
 
-/// SwiftUI wrapper for PHPicker that imports a *single* video and hands you a local file URL.
-/// It copies the picked movie out of the temporary security-scoped location into your app's
-/// temporary directory so you fully own the file (and can feed it to AVFoundation).
-public struct MediaPicker: UIViewControllerRepresentable {
-    /// Called when the user picked a video and we've copied it to an app-owned URL.
-    public let onPicked: (URL) -> Void
-    /// Called when user cancels or we fail to retrieve a video.
-    public let onCancel: () -> Void
+/// SwiftUI-friendly PHPicker for a single *video* that returns a local file URL you own.
+/// - Copies the picked video into your app's Documents/imports directory.
+/// - Returns the new URL via `onPicked`.
+struct MediaPicker: UIViewControllerRepresentable {
+    var onPicked: (URL) -> Void
+    var onCancel: () -> Void
 
-    public init(onPicked: @escaping (URL) -> Void,
-                onCancel: @escaping () -> Void) {
-        self.onPicked = onPicked
-        self.onCancel = onCancel
-    }
-
-    public func makeUIViewController(context: Context) -> PHPickerViewController {
+    func makeUIViewController(context: Context) -> PHPickerViewController {
         var config = PHPickerConfiguration(photoLibrary: .shared())
-        config.filter = .videos               // videos only
-        config.selectionLimit = 1             // single selection
-        config.preferredAssetRepresentationMode = .current // don't auto-transcode
+        config.selectionLimit = 1
+        config.filter = .videos
+        // Prefer current representation (original), avoid transcoding at pick time
+        config.preferredAssetRepresentationMode = .current
 
-        let picker = PHPickerViewController(configuration: config)
-        picker.delegate = context.coordinator
-        return picker
+        let vc = PHPickerViewController(configuration: config)
+        vc.delegate = context.coordinator
+        return vc
     }
 
-    public func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
 
-    public func makeCoordinator() -> Coordinator {
-        Coordinator(parent: self)
-    }
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
 
-    public final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
         private let parent: MediaPicker
-        init(parent: MediaPicker) { self.parent = parent }
+        init(_ parent: MediaPicker) { self.parent = parent }
 
-        public func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
-            // Always dismiss first; then deliver callbacks.
-            defer { picker.dismiss(animated: true, completion: nil) }
-
-            guard let result = results.first else {
-                parent.onCancel()
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            guard let itemProvider = results.first?.itemProvider else {
+                picker.dismiss(animated: true) { self.parent.onCancel() }
                 return
             }
 
-            let provider = result.itemProvider
-            // Use the UniformTypeIdentifiers movie type
-            let movieUTI = UTType.movie.identifier
-
-            if provider.hasItemConformingToTypeIdentifier(movieUTI) {
-                provider.loadFileRepresentation(forTypeIdentifier: movieUTI) { [weak self] tempURL, error in
-                    guard let self else { return }
-                    // Jump to main for callbacks after we copy
-                    if let error = error {
-                        DispatchQueue.main.async { self.parent.onCancel() }
-                        print("MediaPicker error: \(error.localizedDescription)")
-                        return
+            // Ask for a file URL; PHPicker can vend either movie or raw data.
+            if itemProvider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
+                itemProvider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, error in
+                    DispatchQueue.main.async {
+                        picker.dismiss(animated: true) {}
                     }
-                    guard let tempURL else {
-                        DispatchQueue.main.async { self.parent.onCancel() }
-                        return
+                    if let error { print("Picker loadFile error:", error.localizedDescription) }
+                    guard let srcURL = url else { return self.parent.onCancel() }
+                    self.copyToImportsAndReturn(srcURL: srcURL)
+                }
+            } else if itemProvider.hasItemConformingToTypeIdentifier(UTType.audiovisualContent.identifier) {
+                // Fallback: load data and write it ourselves
+                itemProvider.loadDataRepresentation(forTypeIdentifier: UTType.audiovisualContent.identifier) { data, error in
+                    DispatchQueue.main.async {
+                        picker.dismiss(animated: true) {}
                     }
-
-                    // Copy to an app-owned temp location (so it persists beyond picker lifecycle)
-                    let ext = tempURL.pathExtension.isEmpty ? "mov" : tempURL.pathExtension
-                    let dest = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("import-\(UUID().uuidString).\(ext)")
-
-                    do {
-                        // Remove if a previous file exists at dest (very unlikely)
-                        try? FileManager.default.removeItem(at: dest)
-                        try FileManager.default.copyItem(at: tempURL, to: dest)
-                        DispatchQueue.main.async { self.parent.onPicked(dest) }
-                    } catch {
-                        print("MediaPicker copy error: \(error)")
-                        DispatchQueue.main.async { self.parent.onCancel() }
-                    }
+                    if let error { print("Picker loadData error:", error.localizedDescription) }
+                    guard let data, !data.isEmpty else { return self.parent.onCancel() }
+                    self.writeDataToImportsAndReturn(data: data)
                 }
             } else {
-                // Fallback: ask for public.movie via data rep if needed (rare)
-                provider.loadInPlaceFileRepresentation(forTypeIdentifier: movieUTI) { [weak self] url, _, _ in
-                    guard let self, let url else {
-                        DispatchQueue.main.async { self?.parent.onCancel() }
-                        return
-                    }
-                    let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension
-                    let dest = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("import-\(UUID().uuidString).\(ext)")
-                    do {
-                        try? FileManager.default.removeItem(at: dest)
-                        try FileManager.default.copyItem(at: url, to: dest)
-                        DispatchQueue.main.async { self.parent.onPicked(dest) }
-                    } catch {
-                        print("MediaPicker fallback copy error: \(error)")
-                        DispatchQueue.main.async { self.parent.onCancel() }
-                    }
-                }
+                picker.dismiss(animated: true) { self.parent.onCancel() }
             }
+        }
+
+        // MARK: - File moves
+
+        private func copyToImportsAndReturn(srcURL: URL) {
+            do {
+                let dest = try Self.makeImportsURL(withExtension: srcURL.pathExtension)
+                // Ensure fresh destination
+                try? FileManager.default.removeItem(at: dest)
+                try FileManager.default.copyItem(at: srcURL, to: dest)
+                DispatchQueue.main.async { self.parent.onPicked(dest) }
+            } catch {
+                print("Copy to imports failed:", error)
+                DispatchQueue.main.async { self.parent.onCancel() }
+            }
+        }
+
+        private func writeDataToImportsAndReturn(data: Data) {
+            do {
+                let dest = try Self.makeImportsURL(withExtension: "mov")
+                try data.write(to: dest, options: .atomic)
+                DispatchQueue.main.async { self.parent.onPicked(dest) }
+            } catch {
+                print("Write to imports failed:", error)
+                DispatchQueue.main.async { self.parent.onCancel() }
+            }
+        }
+
+        private static func makeImportsURL(withExtension ext: String) throws -> URL {
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+            let dir = docs.appendingPathComponent("imports", isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir.appendingPathComponent("main-\(UUID().uuidString).\(ext)")
         }
     }
 }
+

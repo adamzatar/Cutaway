@@ -6,76 +6,98 @@
 //
 
 import SwiftUI
+import AVFoundation
 
 struct ReactionRecordView: View {
     @Environment(\.dismiss) private var dismiss
-    @StateObject private var rec = CameraRecorder()
-
     let onFinish: (URL) -> Void
+
+    @StateObject private var rec = CameraRecorder()
+    @State private var errorMsg: String?
+    @State private var isReady = false
 
     var body: some View {
         ZStack {
-            CameraPreviewView(layer: rec.previewLayer)
-                .ignoresSafeArea()
+            if isReady {
+                CameraPreviewView(layer: rec.previewLayer)
+                    .ignoresSafeArea()
+            } else {
+                Color.black.ignoresSafeArea()
+                ProgressView("Preparing camera…").tint(.white)
+            }
 
             VStack {
-                Spacer()
-                HStack(spacing: 24) {
+                HStack {
                     Button {
+                        rec.stopSession()
                         dismiss()
                     } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 18, weight: .bold))
+                        Image(systemName: "xmark.circle.fill").font(.title2)
                             .foregroundStyle(.white)
-                            .padding(14)
-                            .background(.black.opacity(0.35), in: Circle())
+                            .padding(12)
                     }
+                    Spacer()
+                }
+                .padding(.top, 8)
 
+                Spacer()
+
+                HStack(spacing: 24) {
                     Button {
                         if rec.isRecording { rec.stopRecording() } else { rec.startRecording() }
                     } label: {
-                        Circle()
-                            .fill(rec.isRecording ? .red : .white)
-                            .frame(width: 80, height: 80)
-                            .overlay(Circle().stroke(.black.opacity(0.25), lineWidth: 2))
+                        ZStack {
+                            Circle().fill(rec.isRecording ? .red : .white)
+                                .frame(width: 72, height: 72)
+                                .shadow(radius: 6)
+                            if rec.isRecording {
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(.white)
+                                    .frame(width: 28, height: 28)
+                            }
+                        }
                     }
 
                     Button {
-                        // toggle front/back later if needed
+                        rec.stopSession()
+                        dismiss()
                     } label: {
-                        Image(systemName: "arrow.triangle.2.circlepath.camera")
-                            .font(.system(size: 18, weight: .bold))
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 44))
                             .foregroundStyle(.white)
-                            .padding(14)
-                            .background(.black.opacity(0.35), in: Circle())
+                            .opacity(rec.isRecording ? 0.3 : 1)
                     }
+                    .disabled(rec.isRecording)
                 }
                 .padding(.bottom, 32)
             }
         }
         .task {
+            // Prepare recorder and start preview. Errors surface as alert.
             do {
+                rec.onFinished = { url in onFinish(url) }
+                rec.onFailed = { err in errorMsg = err.localizedDescription }
                 try await rec.configureSession()
                 rec.startSession()
-                rec.onFinished = { url in
-                    onFinish(url)
-                    dismiss()
-                }
-                rec.onFailed = { _ in
-                    dismiss()
-                }
+                isReady = true
             } catch {
-                dismiss()
+                errorMsg = error.localizedDescription
             }
         }
         .onDisappear {
             rec.stopSession()
         }
+        .alert("Camera Error", isPresented: Binding(
+            get: { errorMsg != nil },
+            set: { _ in errorMsg = nil }
+        )) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(errorMsg ?? "Unknown error")
+        }
     }
 }
 
 #Preview {
-    ReactionRecordView { url in
-        print("Recorded to: \(url)")
-    }
+    ReactionRecordView(onFinish: { _ in })
 }

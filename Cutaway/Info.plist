@@ -37,6 +37,8 @@
 	</dict>
 	<key>CFBundleSignature</key>
 	<string></string>
+	<key>NSMicrophoneInjectionUsageDescription</key>
+	<string></string>
 	<key>NSMicrophoneUsageDescription
 NSMicrophoneUsageDescription
 NSMicrophoneUsageDescription

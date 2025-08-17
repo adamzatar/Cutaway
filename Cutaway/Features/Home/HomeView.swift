@@ -9,6 +9,7 @@ import SwiftUI
 import AVFoundation
 
 struct HomeView: View {
+    @EnvironmentObject private var library: LibraryStore
     @StateObject private var vm = HomeViewModel()
     @State private var goPreview = false
 
@@ -42,7 +43,7 @@ struct HomeView: View {
                             Button {
                                 vm.showingPicker = true
                             } label: {
-                                Label("Pick Main Video", systemImage: "photo.on.rectangle")
+                                Label("Pick Main Video", systemImage: "photo.on.rectangle").foregroundColor(.white)
                             }
                             .buttonStyle(.borderedProminent)
                         }
@@ -104,7 +105,7 @@ struct HomeView: View {
                 }
             }
             .navigationDestination(isPresented: $goPreview) {
-                if let pvm = vm.makePreviewViewModel() {
+                if let pvm = vm.makePreviewViewModel(library: library) {
                     PreviewView(viewModel: pvm)
                 } else {
                     Text("Missing main clip or reactions.")

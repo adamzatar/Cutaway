@@ -145,8 +145,9 @@ struct ActivityView: UIViewControllerRepresentable {
 // MARK: - Preview
 
 #Preview {
-    // Minimal stub for Canvas — use a dummy URL that won’t crash (player won’t load if file missing)
     let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("dummy.mov")
-    let vm = PreviewViewModel(mainClipURL: tmp, reactions: [])
-    return NavigationStack { PreviewView(viewModel: vm) }
+    let store = LibraryStore()
+    let vm = PreviewViewModel(mainClipURL: tmp, reactions: [], library: store)
+    NavigationStack { PreviewView(viewModel: vm) }
+        .environmentObject(store) // optional, nice to have
 }
