@@ -204,4 +204,8 @@ final class LibraryStore: ObservableObject {
     private func documentsDir() -> URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
     }
+    func clearAllSeries() {
+        series.removeAll()
+        save()
+    }
 }

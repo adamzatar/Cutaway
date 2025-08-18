@@ -9,145 +9,252 @@ import Foundation
 import SwiftUI
 import AVKit
 import AVFoundation
+import Combine
 
-/// Shows a lightweight preview (plays the main clip) and handles export UX (progress, share).
 struct PreviewView: View {
-    @ObservedObject var viewModel: PreviewViewModel
+    @StateObject private var viewModel: PreviewViewModel
 
-    // Simple local preview player — this is *not* the final edit, just the main clip for context.
-    @State private var player: AVPlayer?
+    init(viewModel: PreviewViewModel) {
+        _viewModel = StateObject(wrappedValue: viewModel)
+    }
 
-    // Share sheet
-    @State private var showShareSheet = false
+    @Environment(\.colorScheme) private var scheme
+
+    // Stitched preview player (TimelinePreviewBuilder output)
+    @State private var player = AVPlayer()
+    @State private var ticker = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        VStack(spacing: 0) {
-            // PREVIEW PLAYER
-            ZStack {
-                if let p = player {
-                    VideoPlayer(player: p)
-                        .onAppear { p.play() }
-                        .onDisappear { p.pause() }
-                        .frame(maxHeight: 320)
-                } else {
-                    Rectangle()
-                        .fill(.secondary.opacity(0.1))
-                        .overlay(
-                            VStack(spacing: 8) {
-                                Image(systemName: "play.rectangle")
-                                    .font(.system(size: 40))
-                                    .foregroundStyle(.secondary)
-                                Text("Preview")
-                                    .foregroundStyle(.secondary)
-                            }
-                        )
-                        .frame(maxHeight: 320)
-                }
+        ZStack {
+            // BRAND BACKGROUND
+            AppColor.background(scheme).ignoresSafeArea()
+            BrandGradient.primary().opacity(scheme == .dark ? 0.18 : 0.28)
+                .ignoresSafeArea()
+            if scheme == .dark {
+                BrandGradient.halo().ignoresSafeArea()
             }
 
-            // EXPORT CONTROLS
-            Form {
-                Section("Episode") {
-                    HStack {
-                        Label("Main", systemImage: "film")
-                        Spacer()
-                        Text(viewModel.mainClipURL.lastPathComponent)
-                            .lineLimit(1)
-                            .foregroundStyle(.secondary)
-                    }
+            ScrollView {
+                VStack(spacing: 16) {
 
-                    HStack {
-                        Label("Reactions", systemImage: "person.line.dotted.person.fill")
-                        Spacer()
-                        Text("\(viewModel.reactions.count)")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                Section {
-                    if viewModel.isExporting {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                ProgressView(value: Double(viewModel.exportProgress), total: 1.0)
-                                    .progressViewStyle(.linear)
-                                Text("\(Int(viewModel.exportProgress * 100))%")
-                                    .monospacedDigit()
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
+                    // HEADER PLAYER
+                    VStack(alignment: .leading, spacing: 8) {
+                        VideoPlayer(player: player)
+                            .frame(height: 260)
+                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 16)
+                                    .strokeBorder(.white.opacity(0.12), lineWidth: 1)
                             }
-                            Button(role: .destructive) {
+                            .onAppear {
+                                if viewModel.previewItem == nil {
+                                    viewModel.rebuildPreview()
+                                } else {
+                                    player.replaceCurrentItem(with: viewModel.previewItem)
+                                    player.play()
+                                }
+                            }
+                            .onReceive(ticker) { _ in
+                                let newItem = viewModel.previewItem
+                                if player.currentItem !== newItem {
+                                    player.replaceCurrentItem(with: newItem)
+                                    if newItem != nil { player.play() }
+                                }
+                            }
+
+                        Text("Live Preview")
+                            .font(.caption)
+                            .padding(.horizontal, 10).padding(.vertical, 4)
+                            .background(.thinMaterial)
+                            .clipShape(Capsule())
+                            .foregroundStyle(AppColor.primaryText(scheme))
+                    }
+                    .padding(.horizontal, 16)
+
+                    // RHYTHM CARD
+                    ThemedCard {
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack {
+                                Image(systemName: "metronome.fill")
+                                    .foregroundStyle(BrandColor.lavender)
+                                Text("Alternating Rhythm")
+                                    .font(.headline)
+                            }
+
+                            HStack {
+                                Text("Main: \(Int(viewModel.mainChunkSec))s")
+                                Slider(value: $viewModel.mainChunkSec, in: 3...12, step: 1)
+                            }
+                            HStack {
+                                Text("Reaction: \(Int(viewModel.reactionChunkSec))s")
+                                Slider(value: $viewModel.reactionChunkSec, in: 3...10, step: 1)
+                            }
+                            Text("Plays main → reaction → main → reaction, until time runs out.")
+                                .font(.caption)
+                                .foregroundStyle(AppColor.secondaryText(scheme))
+                        }
+                    }
+                    .onChange(of: viewModel.mainChunkSec) { _, _ in viewModel.rebuildPreview() }
+                    .onChange(of: viewModel.reactionChunkSec) { _, _ in viewModel.rebuildPreview() }
+
+                    // BLEEPS CARD
+                    ThemedCard {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Image(systemName: "speaker.slash.fill")
+                                    .foregroundStyle(BrandColor.coral)
+                                Text("Bleeps")
+                                    .font(.headline)
+                            }
+
+                            HStack(spacing: 10) {
+                                Button {
+                                    let secs = player.currentTime().seconds
+                                    viewModel.addBleep(at: secs.isFinite ? secs : 0)
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                } label: {
+                                    Label("Add at Playhead", systemImage: "plus.circle.fill")
+                                }
+                                .buttonStyle(.borderedProminent)
+
+                                Button {
+                                    player.seek(to: .zero)
+                                } label: {
+                                    Image(systemName: "gobackward")
+                                }
+                                .buttonStyle(.bordered)
+                                .help("Jump to start")
+                            }
+
+                            if viewModel.bleepMarksSec.isEmpty {
+                                Text("No bleeps yet. Add one at the current playhead time.")
+                                    .foregroundStyle(AppColor.secondaryText(scheme))
+                            } else {
+                                ForEach(Array(viewModel.bleepMarksSec.enumerated()), id: \.offset) { idx, s in
+                                    HStack {
+                                        Text(String(format: "Bleep at %.2fs", s))
+                                        Spacer()
+                                        Button(role: .destructive) {
+                                            viewModel.removeBleep(at: IndexSet(integer: idx))
+                                        } label: {
+                                            Image(systemName: "trash")
+                                        }
+                                    }
+                                    .padding(.vertical, 4)
+                                }
+                            }
+                        }
+                    }
+
+                    // REACTIONS CARD
+                    ThemedCard {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Image(systemName: "person.line.dotted.person.fill")
+                                    .foregroundStyle(BrandColor.mint)
+                                Text("Reactions Included")
+                                    .font(.headline)
+                            }
+
+                            if viewModel.reactions.isEmpty {
+                                Text("No reactions. Go back and record at least one.")
+                                    .foregroundStyle(AppColor.secondaryText(scheme))
+                            } else {
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 8) {
+                                        ForEach(viewModel.reactions) { r in
+                                            Text(r.displayName.isEmpty ? "Guest" : r.displayName)
+                                                .padding(.horizontal, 12)
+                                                .padding(.vertical, 6)
+                                                .background(.ultraThinMaterial)
+                                                .clipShape(Capsule())
+                                        }
+                                    }
+                                    .padding(.vertical, 2)
+                                }
+                            }
+                        }
+                    }
+
+                    // EXPORT CARD
+                    VStack(spacing: 12) {
+                        if viewModel.isExporting {
+                            ProgressView(value: Double(viewModel.exportProgress))
+                                .progressViewStyle(.linear)
+                                .tint(BrandColor.lavender)
+
+                            Button("Cancel Export") {
                                 viewModel.cancelExport()
+                            }
+                            .buttonStyle(.bordered)
+                        } else {
+                            Button {
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                viewModel.exportEpisode()
                             } label: {
-                                Label("Cancel Export", systemImage: "xmark.circle")
+                                Label("Export Episode", systemImage: "square.and.arrow.up")
+                                    .font(.headline)
                             }
+                            .buttonStyle(GradientButtonStyle())
+                            .disabled(viewModel.reactions.isEmpty)
                         }
-                    } else {
-                        Button {
-                            viewModel.exportEpisode()
-                        } label: {
-                            HStack {
-                                Image(systemName: "square.and.arrow.up.on.square")
-                                Text("Export Episode")
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
 
                         if let err = viewModel.exportError {
-                            Text(err).foregroundStyle(.red).font(.footnote)
-                        }
-                    }
-                }
-
-                if let url = viewModel.exportSuccessURL {
-                    Section("Exported") {
-                        HStack {
-                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                            Text("Saved file ready")
-                            Spacer()
-                            Button("Share") { showShareSheet = true }
-                        }
-                        .sheet(isPresented: $showShareSheet) {
-                            ActivityView(items: [url])
+                            Text("Export failed: \(err)")
+                                .foregroundStyle(.red)
+                                .font(.caption)
                         }
 
-                        Button {
-                            // Quick local playback of the final render
-                            let p = AVPlayer(url: url)
-                            self.player = p
-                            p.play()
-                        } label: {
-                            Label("Play Final", systemImage: "play.fill")
+                        if let url = viewModel.exportSuccessURL {
+                            HStack {
+                                Image(systemName: "checkmark.seal.fill").foregroundStyle(.green)
+                                Text("Exported to Photos & Library")
+                                Spacer()
+                                ShareLink(item: url) { Image(systemName: "square.and.arrow.up") }
+                            }
+                            .padding(.top, 6)
                         }
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 24)
                 }
+                .padding(.top, 16)
             }
         }
         .navigationTitle("Preview")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear {
-            // Set up a simple preview of the *main* clip for context (not the final edit)
-            self.player = AVPlayer(url: viewModel.mainClipURL)
+    }
+}
+
+// MARK: - Themed Card
+
+private struct ThemedCard<Content: View>: View {
+    @Environment(\.colorScheme) private var scheme
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            content
         }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(AppColor.surface(scheme))
+                .overlay(BrandGradient.glass().clipShape(RoundedRectangle(cornerRadius: 16)))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(.white.opacity(0.10), lineWidth: 1)
+        }
+        .padding(.horizontal, 16)
     }
 }
-
-// MARK: - UIKit Share Sheet wrapper
-
-struct ActivityView: UIViewControllerRepresentable {
-    let items: [Any]
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
-    }
-    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
-}
-
-
-// MARK: - Preview
 
 #Preview {
     let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("dummy.mov")
     let store = LibraryStore()
     let vm = PreviewViewModel(mainClipURL: tmp, reactions: [], library: store)
-    NavigationStack { PreviewView(viewModel: vm) }
-        .environmentObject(store) // optional, nice to have
+    return NavigationStack { PreviewView(viewModel: vm) }
+        .environmentObject(store)
+        .preferredColorScheme(.dark)
 }

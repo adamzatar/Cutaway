@@ -7,70 +7,71 @@
 
 
 import Foundation
-import SwiftUI
-import AVFoundation
+@preconcurrency import AVFoundation   // quiets Sendable warnings from AVF
 import CoreMedia
 import UIKit
+import SwiftUI
 
-/// Lightweight front‑camera + mic movie recorder suitable for SwiftUI.
-/// - Permissions handled internally
-/// - 720p for perf
-/// - 30s cap (configurable)
-/// - Writes .mov into a temp URL and calls `onFinished` or `onFailed`
-final class CameraRecorder: NSObject, ObservableObject {
+/// Front‑camera + mic recorder for reaction clips.
+/// - iOS 16+
+/// - 720p preset (perf)
+/// - 30s default cap
+/// - Writes .mov to a temp URL
+@MainActor
+public final class CameraRecorder: NSObject, ObservableObject {
 
-    // MARK: - Public observable state (updated on main)
-    @Published private(set) var isSessionRunning: Bool = false
-    @Published private(set) var isRecording: Bool = false
-    @Published private(set) var lastError: String?
+    // MARK: UI State (main-actor)
+    @Published public private(set) var isSessionRunning = false
+    @Published public private(set) var isRecording = false
+    @Published public private(set) var lastError: String?
 
-    /// Called when a recording finishes successfully with the file URL.
-    var onFinished: ((URL) -> Void)?
-    /// Called when a recording fails or is cancelled.
-    var onFailed: ((Error) -> Void)?
+    /// Callback when a recording finishes successfully.
+    public var onFinished: ((URL) -> Void)?
+    /// Callback when a recording fails.
+    public var onFailed: ((Error) -> Void)?
 
-    // MARK: - Private capture graph
-    private let session = AVCaptureSession()
-    private let movieOutput = AVCaptureMovieFileOutput()
-    private var videoInput: AVCaptureDeviceInput?
-    private var audioInput: AVCaptureDeviceInput?
+    // MARK: Capture Graph (lives on a private queue)
+    // Marked nonisolated(unsafe) so @Sendable closures on `sessionQueue` can access.
+    nonisolated(unsafe) private let session = AVCaptureSession()
+    nonisolated(unsafe) private let movieOutput = AVCaptureMovieFileOutput()
+    nonisolated(unsafe) private var videoInput: AVCaptureDeviceInput?
+    nonisolated(unsafe) private var audioInput: AVCaptureDeviceInput?
 
-    /// All capture mutations happen here (off main).
+    /// Heavy work queue (not main actor).
     private let sessionQueue = DispatchQueue(label: "CameraRecorder.session")
 
-    /// Max duration for a single reaction clip (default 30s).
-    var maxSeconds: Double = 30 {
+    /// SwiftUI can embed this layer via `CameraPreviewView`.
+    public let previewLayer: AVCaptureVideoPreviewLayer
+
+    /// Hard cap per clip (seconds). Default 30.
+    public var maxSeconds: Double = 30 {
         didSet {
             let t = CMTime(seconds: max(1, maxSeconds), preferredTimescale: 600)
             movieOutput.maxRecordedDuration = t
         }
     }
 
-    /// Preview layer to embed in SwiftUI (via `CameraPreviewView` below).
-    lazy var previewLayer: AVCaptureVideoPreviewLayer = {
-        let l = AVCaptureVideoPreviewLayer(session: session)
-        l.videoGravity = .resizeAspectFill
-        return l
-    }()
+    // MARK: Lifecycle
 
-    // MARK: - Lifecycle
-
-    override init() {
+    public override init() {
+        self.previewLayer = AVCaptureVideoPreviewLayer(session: session)
         super.init()
-        // sensible defaults
+        previewLayer.videoGravity = .resizeAspectFill
+
+        movieOutput.movieFragmentInterval = .invalid  // single moov atom at end
         movieOutput.maxRecordedDuration = CMTime(seconds: maxSeconds, preferredTimescale: 600)
-        movieOutput.movieFragmentInterval = .invalid // write single moov atom at end
     }
 
     deinit {
-        session.stopRunning()
+        // Stop safely off-main (we’re not touching @Published here).
+        sessionQueue.async { [session] in session.stopRunning() }
     }
 
-    // MARK: - Permissions
+    // MARK: Permissions
 
-    enum CameraPermissionError: LocalizedError {
+    public enum CameraPermissionError: LocalizedError {
         case cameraDenied, micDenied
-        var errorDescription: String? {
+        public var errorDescription: String? {
             switch self {
             case .cameraDenied: return "Camera access is denied."
             case .micDenied:    return "Microphone access is denied."
@@ -78,8 +79,7 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
     }
 
-    /// Ask for camera + mic permission if needed (awaits prompts).
-    private func ensurePermissions() async throws {
+    public func requestPermissions() async throws {
         // Camera
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized: break
@@ -91,7 +91,6 @@ final class CameraRecorder: NSObject, ObservableObject {
         default:
             throw CameraPermissionError.cameraDenied
         }
-
         // Mic
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized: break
@@ -105,72 +104,59 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Configure / Start / Stop
+    // MARK: Configure / Start / Stop
 
-    /// Prepare the session graph: front camera + mic → movie file output.
-    func configureSession() async throws {
-        try await ensurePermissions()
-
-        let uiOrientation: UIInterfaceOrientation = await MainActor.run {
-            (UIApplication.shared.connectedScenes
-                .compactMap { $0 as? UIWindowScene }
-                .first?.interfaceOrientation) ?? .portrait
-        }
+    /// Build the session graph (front camera + mic → movie output).
+    public func configureSession() async throws {
+        try await requestPermissions()
 
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            sessionQueue.async { [weak self] in
-                guard let self else {
-                    cont.resume(throwing: NSError(domain: "CameraRecorder", code: -1))
-                    return
-                }
+            sessionQueue.async { [self] in
                 do {
-                    self.session.beginConfiguration()
-                    defer { self.session.commitConfiguration() }
+                    session.beginConfiguration()
+                    defer { session.commitConfiguration() }
 
-                    self.session.sessionPreset = .hd1280x720
+                    session.sessionPreset = .hd1280x720
 
-                    if let vi = self.videoInput { self.session.removeInput(vi) }
-                    if let ai = self.audioInput { self.session.removeInput(ai) }
-                    if self.session.outputs.contains(self.movieOutput) {
-                        self.session.removeOutput(self.movieOutput)
+                    // Clean any prior config
+                    if let vi = videoInput { session.removeInput(vi) }
+                    if let ai = audioInput { session.removeInput(ai) }
+                    if session.outputs.contains(movieOutput) {
+                        session.removeOutput(movieOutput)
                     }
 
-                    guard let device = AVCaptureDevice.default(.builtInWideAngleCamera,
-                                                               for: .video,
-                                                               position: .front) else {
-                        throw NSError(domain: "CameraRecorder",
-                                      code: -2,
+                    // Front wide camera
+                    guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
+                    else {
+                        throw NSError(domain: "CameraRecorder", code: -1,
                                       userInfo: [NSLocalizedDescriptionKey: "Front camera unavailable"])
                     }
 
-                    if (try? device.lockForConfiguration()) != nil {
-                        if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
-                        if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
-                        device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
-                        device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
-                        device.unlockForConfiguration()
-                    }
+                    // Tuning
+                    try? camera.lockForConfiguration()
+                    if camera.isFocusModeSupported(.continuousAutoFocus) { camera.focusMode = .continuousAutoFocus }
+                    if camera.isExposureModeSupported(.continuousAutoExposure) { camera.exposureMode = .continuousAutoExposure }
+                    camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+                    camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+                    camera.unlockForConfiguration()
 
-                    let vInput = try AVCaptureDeviceInput(device: device)
-                    if self.session.canAddInput(vInput) { self.session.addInput(vInput); self.videoInput = vInput }
+                    let vIn = try AVCaptureDeviceInput(device: camera)
+                    if session.canAddInput(vIn) { session.addInput(vIn); videoInput = vIn }
 
                     if let mic = AVCaptureDevice.default(for: .audio) {
-                        let aInput = try AVCaptureDeviceInput(device: mic)
-                        if self.session.canAddInput(aInput) { self.session.addInput(aInput); self.audioInput = aInput }
+                        let aIn = try AVCaptureDeviceInput(device: mic)
+                        if session.canAddInput(aIn) { session.addInput(aIn); audioInput = aIn }
                     }
 
-                    if self.session.canAddOutput(self.movieOutput) { self.session.addOutput(self.movieOutput) }
-
-                    if let conn = self.movieOutput.connection(with: .video) {
-                        conn.isVideoMirrored = true
-                        self.applyOrientation(uiOrientation, to: conn)
-                        if conn.isVideoStabilizationSupported {
-                            conn.preferredVideoStabilizationMode = .auto
-                        }
+                    if session.canAddOutput(movieOutput) {
+                        session.addOutput(movieOutput)
                     }
 
-                    // ✅ Return Void explicitly
-                    cont.resume(returning: ())
+                    // Update UI state on main
+                    Task { @MainActor in
+                        self.isSessionRunning = self.session.isRunning
+                    }
+                    cont.resume()
                 } catch {
                     cont.resume(throwing: error)
                 }
@@ -178,98 +164,97 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
     }
 
-    /// Start camera capture (preview).
-    func startSession() {
-        sessionQueue.async { [weak self] in
-            guard let self, !self.session.isRunning else { return }
-            self.session.startRunning()
-            DispatchQueue.main.async { self.isSessionRunning = true }
+    public func startSession() {
+        sessionQueue.async { [self] in
+            guard !session.isRunning else { return }
+            session.startRunning()
+            Task { @MainActor in self.isSessionRunning = true }
         }
     }
 
-    /// Stop camera capture (preview).
-    func stopSession() {
-        sessionQueue.async { [weak self] in
-            guard let self, self.session.isRunning else { return }
-            self.session.stopRunning()
-            DispatchQueue.main.async { self.isSessionRunning = false }
+    public func stopSession() {
+        sessionQueue.async { [self] in
+            guard session.isRunning else { return }
+            session.stopRunning()
+            Task { @MainActor in self.isSessionRunning = false }
         }
     }
 
-    // MARK: - Recording
+    // MARK: Recording
 
-    /// Begin recording to a temp .mov file. Use `stopRecording()` to end early, or it auto‑stops at `maxSeconds`.
-    func startRecording() {
+    public func startRecording() {
         guard !isRecording else { return }
-        let url = FileManager.default.temporaryDirectory
+        let dest = FileManager.default.temporaryDirectory
             .appendingPathComponent("reaction-\(UUID().uuidString).mov")
 
-        // Refresh orientation from main, then start on session queue
-        Task { @MainActor in
-            let uiOrientation = (UIApplication.shared.connectedScenes
-                .compactMap { $0 as? UIWindowScene }
-                .first?.interfaceOrientation) ?? .portrait
+        // Compute rotation angle on main (UIKit), then apply on session queue.
+        let angle = currentVideoRotationAngleMainActor()
 
-            sessionQueue.async { [weak self] in
-                guard let self else { return }
-                if let conn = self.movieOutput.connection(with: .video) {
-                    self.applyOrientation(uiOrientation, to: conn)
-                    conn.isVideoMirrored = true
-                }
-                self.movieOutput.startRecording(to: url, recordingDelegate: self)
-                DispatchQueue.main.async { self.isRecording = true }
-            }
+        sessionQueue.async { [self] in
+            applyConnectionOrientationOnQueue(angle: angle)
+            movieOutput.startRecording(to: dest, recordingDelegate: self)
+            Task { @MainActor in self.isRecording = true }
         }
     }
 
-    func stopRecording() {
-        sessionQueue.async { [weak self] in
-            guard let self, self.movieOutput.isRecording else { return }
-            self.movieOutput.stopRecording()
+    public func stopRecording() {
+        sessionQueue.async { [self] in
+            guard movieOutput.isRecording else { return }
+            movieOutput.stopRecording()
         }
     }
 
-    // MARK: - Orientation helpers
+    // MARK: Orientation helpers
 
-    /// Apply UIInterfaceOrientation to the capture connection using the best API per iOS version.
-    private func applyOrientation(_ io: UIInterfaceOrientation, to connection: AVCaptureConnection) {
+    /// Read UI orientation on the main actor and map to degrees.
+    private func currentVideoRotationAngleMainActor() -> CGFloat {
+        let orientation = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?
+            .interfaceOrientation ?? .portrait
+        switch orientation {
+        case .landscapeLeft:      return 90
+        case .landscapeRight:     return 270
+        case .portraitUpsideDown: return 180
+        default:                  return 0
+        }
+    }
+
+    /// MUST be called from `sessionQueue`.
+    nonisolated(unsafe) private func applyConnectionOrientationOnQueue(angle: CGFloat) {
+        guard let conn = movieOutput.connection(with: .video) else { return }
+
         if #available(iOS 17.0, *) {
-            // Use rotation angles (degrees)
-            switch io {
-            case .landscapeLeft:  connection.videoRotationAngle = 90
-            case .landscapeRight: connection.videoRotationAngle = 270
-            case .portraitUpsideDown: connection.videoRotationAngle = 180
-            default: connection.videoRotationAngle = 0
-            }
+            conn.videoRotationAngle = angle
         } else {
-            // Legacy orientation API (deprecated in iOS 17, fine on 16)
-            if connection.isVideoOrientationSupported {
-                switch io {
-                case .landscapeLeft:  connection.videoOrientation = .landscapeLeft
-                case .landscapeRight: connection.videoOrientation = .landscapeRight
-                case .portraitUpsideDown: connection.videoOrientation = .portraitUpsideDown
-                default: connection.videoOrientation = .portrait
-                }
+            // iOS 16 fallback
+            switch angle {
+            case 90:  conn.videoOrientation = .landscapeLeft
+            case 270: conn.videoOrientation = .landscapeRight
+            case 180: conn.videoOrientation = .portraitUpsideDown
+            default:  conn.videoOrientation = .portrait
             }
+        }
+        conn.isVideoMirrored = true
+        if conn.isVideoStabilizationSupported {
+            conn.preferredVideoStabilizationMode = .auto
         }
     }
 }
 
-// MARK: - AVCaptureFileOutputRecordingDelegate
+// MARK: - Delegate (nonisolated in Swift 6)
 
 extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
-    func fileOutput(_ output: AVCaptureFileOutput,
-                    didStartRecordingTo fileURL: URL,
-                    from connections: [AVCaptureConnection]) {
-        // No‑op (UI already updated on start)
+
+    public nonisolated func fileOutput(_ output: AVCaptureFileOutput,
+                                       didStartRecordingTo fileURL: URL,
+                                       from connections: [AVCaptureConnection]) {
+        // optional log
     }
 
-    func fileOutput(_ output: AVCaptureFileOutput,
-                    didFinishRecordingTo outputFileURL: URL,
-                    from connections: [AVCaptureConnection],
-                    error: Error?) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+    public nonisolated func fileOutput(_ output: AVCaptureFileOutput,
+                                       didFinishRecordingTo outputFileURL: URL,
+                                       from connections: [AVCaptureConnection],
+                                       error: Error?) {
+        Task { @MainActor in
             self.isRecording = false
             if let error {
                 self.lastError = error.localizedDescription
@@ -281,13 +266,13 @@ extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
     }
 }
 
-// MARK: - SwiftUI preview host for the camera layer
+// MARK: - SwiftUI Preview Host
 
-/// A SwiftUI view that hosts `AVCaptureVideoPreviewLayer` (fills its space).
-struct CameraPreviewView: UIViewRepresentable {
-    let layer: AVCaptureVideoPreviewLayer
+public struct CameraPreviewView: UIViewRepresentable {
+    private let layer: AVCaptureVideoPreviewLayer
+    public init(layer: AVCaptureVideoPreviewLayer) { self.layer = layer }
 
-    func makeUIView(context: Context) -> PreviewHost {
+    public func makeUIView(context: Context) -> UIView {
         let v = PreviewHost()
         v.backgroundColor = .black
         layer.frame = v.bounds
@@ -295,14 +280,14 @@ struct CameraPreviewView: UIViewRepresentable {
         return v
     }
 
-    func updateUIView(_ uiView: PreviewHost, context: Context) {
+    public func updateUIView(_ uiView: UIView, context: Context) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer.frame = uiView.bounds
         CATransaction.commit()
     }
 
-    final class PreviewHost: UIView {
+    private final class PreviewHost: UIView {
         override func layoutSubviews() {
             super.layoutSubviews()
             layer.sublayers?.forEach { $0.frame = bounds }
