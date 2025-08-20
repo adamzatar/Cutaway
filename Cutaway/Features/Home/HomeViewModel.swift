@@ -26,8 +26,8 @@ final class HomeViewModel: ObservableObject {
     }
 
     /// Recorded reaction clips (front cam), in the order user added them.
-    @Published private(set) var reactions: [ReactionClip] = []
-
+    @Published private(set) var reactions: [EpisodeReaction] = []
+    
     /// Derived metadata for UI (thumbnail/time, etc.)
     @Published private(set) var mainDurationSec: Double?
     @Published private(set) var mainFilename: String?
@@ -46,7 +46,7 @@ final class HomeViewModel: ObservableObject {
 
     // MARK: Init
 
-    init(mainClipURL: URL? = nil, reactions: [ReactionClip] = []) {
+    init(mainClipURL: URL? = nil, reactions: [EpisodeReaction] = []) {
         self.mainClipURL = mainClipURL
         self.reactions = reactions
         if mainClipURL != nil {
@@ -66,7 +66,7 @@ final class HomeViewModel: ObservableObject {
         let name = displayName?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty ?? "Me"
-        reactions.append(ReactionClip(url: url, displayName: name))
+        reactions.append(EpisodeReaction(url: url, displayName: name))
     }
 
     func renameReaction(id: UUID, to newName: String) {

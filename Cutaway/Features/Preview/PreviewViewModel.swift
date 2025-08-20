@@ -10,21 +10,19 @@ import SwiftUI
 import AVFoundation
 import Photos
 
-/// Orchestrates: plan → compose → export → save to Photos → persist to Library.
-/// Also owns user-editable params (segment lengths + bleep marks) and a live stitched preview.
 @MainActor
 final class PreviewViewModel: ObservableObject {
     // Inputs
     let mainClipURL: URL
-    let reactions: [ReactionClip]
+    let reactions: [EpisodeReaction]   // <-- Use your unified alias/type here (see note below)
     private let library: LibraryStore
 
     // User‑editable params
-    @Published var mainChunkSec: Double = 8          // N seconds of main
-    @Published var reactionChunkSec: Double = 6      // M seconds of reaction
-    @Published private(set) var bleepMarksSec: [Double] = []  // seconds on the final timeline
+    @Published var mainChunkSec: Double = 8
+    @Published var reactionChunkSec: Double = 6
+    @Published private(set) var bleepMarksSec: [Double] = []
 
-    // Live stitched preview (alternating main ↔ reaction)
+    // Live stitched preview
     @Published var previewItem: AVPlayerItem?
 
     // Export state
@@ -33,33 +31,30 @@ final class PreviewViewModel: ObservableObject {
     @Published var exportError: String?
     @Published var exportSuccessURL: URL?
 
-    private var currentExport: TimelineComposer.ExportHandle?
+    // We keep a reference so we can cancel
+    private var exportSession: AVAssetExportSession?
 
-    // MARK: - Init
-
-    init(mainClipURL: URL, reactions: [ReactionClip], library: LibraryStore) {
+    // MARK: Init
+    init(mainClipURL: URL, reactions: [EpisodeReaction], library: LibraryStore) {
         self.mainClipURL = mainClipURL
         self.reactions = reactions
         self.library = library
-        // Build initial live preview
         Task { rebuildPreview() }
     }
 
-    // MARK: - Live Preview
-
-    /// Build a fast, stitched AVPlayerItem for the UI preview.
-    /// Skips heavy parts (music/SFX/cross-dissolves) for speed. Final export still includes them.
+    // MARK: Live Preview
     func rebuildPreview() {
         Task {
-            // 1) Build timeline from current params
+            // Planner config
             var cfg = SegmentPlanner.Config()
             cfg.mainChunkSeconds = mainChunkSec
             cfg.reactionChunkSeconds = reactionChunkSec
 
-            // Convert bleep seconds to CMTime (planner needs these to mark SFX)
+            // bleep marks to CMTime (if your preview uses them)
             let ts: CMTimeScale = 600
             let bleeps = bleepMarksSec.map { CMTime(seconds: $0, preferredTimescale: ts) }
 
+            // Build engine timeline
             let timeline = await SegmentPlanner.buildAlternatingTimeline(
                 mainURL: mainClipURL,
                 reactions: reactions,
@@ -68,11 +63,12 @@ final class PreviewViewModel: ObservableObject {
                 config: cfg
             )
 
-            // 2) Build an AVPlayerItem for preview
+            // Make a lightweight preview item
             do {
-                let item = try await TimelinePreviewBuilder.makePlayerItem(timeline: timeline,
-                                                                           options: .init())
-                // Publish to UI
+                let item = try await TimelinePreviewBuilder.makePlayerItem(
+                    timeline: timeline,
+                    options: .init(renderSize: .init(width: 1280, height: 720), frameRate: 30)
+                )
                 self.previewItem = item
             } catch {
                 self.previewItem = nil
@@ -81,14 +77,12 @@ final class PreviewViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Bleeps
-
+    // MARK: Bleeps
     func addBleep(at seconds: Double) {
         let s = max(0, seconds)
-        guard !bleepMarksSec.contains(where: { abs($0 - s) < 0.05 }) else { return } // dedupe ~50ms
+        guard !bleepMarksSec.contains(where: { abs($0 - s) < 0.05 }) else { return }
         bleepMarksSec.append(s)
         bleepMarksSec.sort()
-        // Rebuild preview so user hears positions reflected in the stitched timing (SFX is export-only, but timeline bounds shift)
         rebuildPreview()
     }
 
@@ -97,9 +91,7 @@ final class PreviewViewModel: ObservableObject {
         rebuildPreview()
     }
 
-    // MARK: - Export
-
-    /// Build timeline, render, save, persist.
+    // MARK: Export
     func exportEpisode(seriesTitle: String = "My Show") {
         guard !isExporting else { return }
         isExporting = true
@@ -108,7 +100,7 @@ final class PreviewViewModel: ObservableObject {
         exportSuccessURL = nil
 
         Task {
-            // 1) Build timeline using current params
+            // Planner config
             var cfg = SegmentPlanner.Config()
             cfg.mainChunkSeconds = mainChunkSec
             cfg.reactionChunkSeconds = reactionChunkSec
@@ -116,6 +108,7 @@ final class PreviewViewModel: ObservableObject {
             let ts: CMTimeScale = 600
             let bleeps: [CMTime] = bleepMarksSec.map { CMTime(seconds: $0, preferredTimescale: ts) }
 
+            // Build engine timeline
             let timeline = await SegmentPlanner.buildAlternatingTimeline(
                 mainURL: mainClipURL,
                 reactions: reactions,
@@ -124,76 +117,83 @@ final class PreviewViewModel: ObservableObject {
                 config: cfg
             )
 
-            // 2) Export options
+            // Compose
             let options = TimelineComposer.ExportOptions(
-                presetName: AVAssetExportPreset1280x720,
-                frameRate: 30,
                 renderSize: CGSize(width: 1280, height: 720),
-                dissolveSeconds: 0.33,
-                musicGainDb: -18
+                frameRate: 30,
+                videoBitrate: 10_000_000
             )
 
-            // 3) Overlays
-            let overlayLayer = CaptionOverlayProvider()
-                .makeOverlayLayer(for: timeline.overlays, renderSize: options.renderSize)
+            do {
+                let session = try await TimelineComposer.makeExportSession(
+                    timeline: timeline,
+                    options: options
+                )
+                self.exportSession = session
 
-            // 4) Output URL
-            let outputURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("cutaway-\(UUID().uuidString).mp4")
+                // Poll progress
+                Task.detached { [weak session, weak self] in
+                    while let s = session,
+                          s.status == .waiting || s.status == .exporting {
+                        let p = s.progress
+                        await MainActor.run { self?.exportProgress = p }
+                        try? await Task.sleep(nanoseconds: 200_000_000) // 0.2s
+                    }
+                }
 
-            // 5) Compose + export
-            let composer = TimelineComposer()
-            currentExport = composer.export(
-                timeline: timeline,
-                to: outputURL,
-                options: options,
-                overlayLayer: overlayLayer,
-                onProgress: { [weak self] p in
-                    Task { @MainActor in self?.exportProgress = p }
-                },
-                completion: { [weak self] result in
+                // Run export
+                session.exportAsynchronously { [weak self] in
                     Task { @MainActor in
                         guard let self else { return }
                         self.isExporting = false
-                        switch result {
-                        case .success(let url):
+                        switch session.status {
+                        case .completed:
+                            let url = session.outputURL ?? FileManager.default.temporaryDirectory
                             self.exportSuccessURL = url
-                            Task { await self.postExportPersistAndSave(url: url,
-                                                                       duration: timeline.duration.seconds,
-                                                                       seriesTitle: seriesTitle) }
-                        case .failure(let err):
-                            self.exportError = err.localizedDescription
+                            Task {
+                                await self.postExportPersistAndSave(
+                                    url: url,
+                                    duration: timeline.duration.seconds,
+                                    seriesTitle: seriesTitle
+                                )
+                            }
+                        case .failed, .cancelled:
+                            self.exportError = session.error?.localizedDescription ?? "Export failed."
+                        default:
+                            break
                         }
                     }
                 }
-            )
+
+            } catch {
+                self.isExporting = false
+                self.exportError = error.localizedDescription
+            }
         }
     }
 
     func cancelExport() {
-        currentExport?.cancel()
+        exportSession?.cancelExport()
         isExporting = false
     }
 
-    // MARK: - Post export: move file, save to Photos, persist to Library
-
+    // MARK: Save + persist
     private func postExportPersistAndSave(url: URL,
                                           duration: Double,
                                           seriesTitle: String) async {
-        // Move the temp file into our Documents/exports (so we own it)
         let finalURL = library.moveExportIntoLibrary(url) ?? url
 
-        // Photos add-only permission + save
+        // Photos
         let ok = await PermissionsService.ensurePhotosAddPermission()
         if ok {
             PHPhotoLibrary.shared().performChanges({
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: finalURL)
-            }) { success, err in
+            }, completionHandler: { success, err in
                 if let err { print("Save to Photos failed:", err.localizedDescription) }
-            }
+            })
         }
 
-        // Thumbnail + persist to Library
+        // Library
         let thumbURL = await library.generateThumbnail(for: finalURL, at: 1.0)
         let seriesId = library.ensureSeries(seriesTitle, emoji: "📺")
         let episode = Episode(
@@ -204,7 +204,6 @@ final class PreviewViewModel: ObservableObject {
             thumbnailURL: thumbURL,
             templateTag: "Default"
         )
-        // Disambiguated overload with fallback title (matches your LibraryStore)
         library.addEpisode(episode, to: seriesId, fallbackTitle: seriesTitle, emoji: "📺")
     }
 

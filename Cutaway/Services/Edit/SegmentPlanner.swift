@@ -9,20 +9,19 @@ import Foundation
 import AVFoundation
 import CoreMedia
 
-/// Builds a Timeline from simple, opinionated rules (alternating main/reaction chunks).
-/// Scales to N reactions and clamps to asset lengths + a target duration.
+
+/// Builds an engine `Timeline` from simple, opinionated rules (alternating main/reaction chunks).
 public enum SegmentPlanner {
 
     // MARK: Config
 
     public struct Config {
-        public var targetDuration: Double = 60                 // seconds (episode cap)
-        public var mainChunkSeconds: Double = 8                // N seconds of main
-        public var reactionChunkSeconds: Double = 6            // M seconds of each reaction slice
-        public var dissolveSeconds: Double = 0.33              // for UI marks; composer handles fades
-        public var lowerThirdSeconds: Double = 3               // caption length when a reaction starts
-        public var musicGainDb: Float = -18.0                  // matched with composer default
-
+        public var targetDuration: Double = 60
+        public var mainChunkSeconds: Double = 8
+        public var reactionChunkSeconds: Double = 6
+        public var dissolveSeconds: Double = 0.33
+        public var lowerThirdSeconds: Double = 3
+        public var musicGainDb: Float = -18.0
         public init() {}
     }
 
@@ -36,12 +35,12 @@ public enum SegmentPlanner {
         }
     }
 
-    // MARK: Entry point
+    // MARK: Build alternating engine timeline
 
     /// main (N sec) → reaction[i] (M sec) → main (N) → reaction[i+1] (M) → …
     public static func buildAlternatingTimeline(
         mainURL: URL,
-        reactions: [ReactionClip],
+        reactions: [EpisodeReaction],
         musicURL: URL? = nil,
         bleepMarks: [CMTime] = [],
         config: Config = .init()
@@ -49,13 +48,14 @@ public enum SegmentPlanner {
 
         let ts: CMTimeScale = 600
 
-        // ---- Load durations (async modern API) ----
+        // Load durations
         let mainAsset = AVURLAsset(url: mainURL)
-        let mainDuration = (try? await mainAsset.load(.duration)) ?? CMTime(seconds: 0, preferredTimescale: ts)
+        let mainDuration = (try? await mainAsset.load(.duration)) ?? .zero
         let mainLen = mainDuration.seconds
 
         // Reaction assets + durations
-        let reactionAssets: [(clip: ReactionClip, asset: AVURLAsset, duration: CMTime)] = await withTaskGroup(of: (ReactionClip, AVURLAsset, CMTime).self) { group in
+        let reactionAssets: [(clip: EpisodeReaction, asset: AVURLAsset, duration: CMTime)] =
+        await withTaskGroup(of: (EpisodeReaction, AVURLAsset, CMTime).self) { group in
             for rc in reactions {
                 group.addTask {
                     let asset = AVURLAsset(url: rc.url)
@@ -63,24 +63,25 @@ public enum SegmentPlanner {
                     return (rc, asset, dur)
                 }
             }
-            var out: [(ReactionClip, AVURLAsset, CMTime)] = []
+            var out: [(EpisodeReaction, AVURLAsset, CMTime)] = []
             for await x in group { out.append(x) }
             return out
         }
 
-        // ---- Early exit if no media ----
+        // Early exit
         guard mainLen > 0, !reactionAssets.isEmpty else {
-            return Timeline(videoClips: [], audioDialogClips: [], transitions: [], overlays: [], musicBed: nil, sfx: [], duration: .zero)
+            return Timeline(videoClips: [], audioDialogClips: [], transitions: [], overlays: [],
+                            musicBed: nil, sfx: [], duration: .zero)
         }
 
-        // ---- Build alternating plan ----
+        // Build
         var video: [Clip] = []
         var dialog: [Clip] = []
         var overlays: [Overlay] = []
-        var transitions: [Transition] = [] // optional; UI can highlight boundaries
+        var transitions: [Transition] = []
 
-        var cursorTimeline = CMTime.zero         // where we are in the OUTPUT (timeline)
-        var cursorInMain = CMTime.zero           // where we are inside MAIN source
+        var cursorTimeline: CMTime = .zero
+        var cursorInMain: CMTime = .zero
         var reactionIndex = 0
 
         let target = CMTime(seconds: config.targetDuration, preferredTimescale: ts)
@@ -90,27 +91,22 @@ public enum SegmentPlanner {
 
         func clamp(_ t: CMTime, to max: CMTime) -> CMTime { t > max ? max : t }
 
-        // Alternate until we hit either the main’s end or the target duration
         while cursorTimeline < target && cursorInMain < mainDuration {
             // MAIN slice
             let remainingMain = mainDuration - cursorInMain
-            let remainingInEpisode = target - cursorTimeline
-            guard remainingMain > .zero, remainingInEpisode > .zero else { break }
+            let remainingEpisode = target - cursorTimeline
+            guard remainingMain > .zero, remainingEpisode > .zero else { break }
 
-            let mainTake = clamp(nMain, to: min(remainingMain, remainingInEpisode))
-            let mainRangeInSrc = CMTimeRange(start: cursorInMain, duration: mainTake)
-            let mainClip = Clip(url: mainURL, mediaType: .video, source: mainRangeInSrc, at: cursorTimeline)
+            let mainTake = clamp(nMain, to: min(remainingMain, remainingEpisode))
+            let mainRange = CMTimeRange(start: cursorInMain, duration: mainTake)
+            let mainClip = Clip(url: mainURL, mediaType: .video, source: mainRange, at: cursorTimeline)
+            video.append(mainClip); dialog.append(mainClip)
 
-            video.append(mainClip)
-            dialog.append(mainClip)
-
-            // Boundary note for UI (optional)
             transitions.append(Transition(
                 kind: .crossDissolve,
                 range: CMTimeRange(start: max(.zero, cursorTimeline + mainTake - dissolve), duration: dissolve)
             ))
 
-            // advance cursors (explicit + avoids '+=' operator)
             cursorInMain = cursorInMain + mainTake
             cursorTimeline = cursorTimeline + mainTake
             if cursorTimeline >= target { break }
@@ -120,48 +116,38 @@ public enum SegmentPlanner {
             let take = clamp(mReaction, to: min(rDur, target - cursorTimeline))
             guard take > .zero else { break }
 
-            // MVP: reaction starts at 0 (AI can shift later)
-            let rRangeInSrc = CMTimeRange(start: .zero, duration: take)
-            let rClip = Clip(url: rc.url, mediaType: .video, source: rRangeInSrc, at: cursorTimeline)
+            let rRange = CMTimeRange(start: .zero, duration: take)
+            let rClip = Clip(url: rc.url, mediaType: .video, source: rRange, at: cursorTimeline)
+            video.append(rClip); dialog.append(rClip)
 
-            video.append(rClip)
-            dialog.append(rClip)
+            // Lower‑third overlay at +1s
+            let ltStart = cursorTimeline + CMTime(seconds: 1, preferredTimescale: ts)
+            let ltDur = CMTime(seconds: config.lowerThirdSeconds, preferredTimescale: ts)
+            overlays.append(Overlay(
+                range: CMTimeRange(start: ltStart, duration: ltDur),
+                payload: .lowerThird(text: rc.displayName, emoji: "🎤")
+            ))
 
-            // Lower‑third for this reaction at its start (appear at +1s)
-            let lt = LowerThirdSpec(
-                at: cursorTimeline + CMTime(seconds: 1, preferredTimescale: ts),
-                duration: CMTime(seconds: config.lowerThirdSeconds, preferredTimescale: ts),
-                text: rc.displayName,
-                emoji: "🎤"
-            )
-            overlays.append(Overlay(range: CMTimeRange(start: lt.at, duration: lt.duration),
-                                    payload: .lowerThird(text: lt.text, emoji: lt.emoji)))
-
-            // Transition marker at the end of reaction (UI-only)
             transitions.append(Transition(
                 kind: .crossDissolve,
                 range: CMTimeRange(start: max(.zero, cursorTimeline + take - dissolve), duration: dissolve)
             ))
 
-            // advance timeline
             cursorTimeline = cursorTimeline + take
             reactionIndex = (reactionIndex + 1) % reactionAssets.count
         }
 
-        // ---- Music bed (optional) ----
+        // Music (optional)
         let bedURL: URL? = musicURL
-            ?? Self.bundleURL(named: "music_bed", exts: ["mp3"])
-            ?? Self.bundleURL(named: "tvStatic", exts: ["mp3"]) // alternative you added
+            ?? bundleURL(named: "music_bed", exts: ["mp3"])
+            ?? bundleURL(named: "tvStatic", exts: ["mp3"])
         let bed = bedURL.map { AudioBed(url: $0, gainDb: config.musicGainDb) }
 
-        // ---- SFX bleeps (try bleep.wav, fallback bleep.mp3) ----
+        // Bleeps
         var sfx: [AudioSFX] = []
-        if !bleepMarks.isEmpty, let bleepURL = Self.bundleURL(named: "bleep", exts: ["wav", "mp3"]) {
+        if !bleepMarks.isEmpty, let bleepURL = bundleURL(named: "bleep", exts: ["wav","mp3"]) {
             sfx = bleepMarks.map { AudioSFX(url: bleepURL, at: $0, gainDb: 0) }
         }
-
-        // ---- Final duration = how far the cursor advanced ----
-        let finalDuration = cursorTimeline
 
         return Timeline(
             videoClips: video,
@@ -170,17 +156,16 @@ public enum SegmentPlanner {
             overlays: overlays,
             musicBed: bed,
             sfx: sfx,
-            duration: finalDuration
+            duration: cursorTimeline
         )
     }
+}
 
-    // MARK: - Helpers
+// MARK: - File helpers
 
-    /// Try multiple extensions for a given basename in the main bundle.
-    private static func bundleURL(named name: String, exts: [String]) -> URL? {
-        for ext in exts {
-            if let u = Bundle.main.url(forResource: name, withExtension: ext) { return u }
-        }
-        return nil
+private func bundleURL(named name: String, exts: [String]) -> URL? {
+    for ext in exts {
+        if let u = Bundle.main.url(forResource: name, withExtension: ext) { return u }
     }
+    return nil
 }

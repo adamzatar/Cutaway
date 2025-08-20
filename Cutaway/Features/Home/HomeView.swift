@@ -5,7 +5,6 @@
 //  Created by Adam Zaatar on 8/15/25.
 //
 
-
 import SwiftUI
 import AVFoundation
 import UIKit
@@ -18,14 +17,14 @@ struct HomeView: View {
     @State private var goPreview = false
     @AppStorage("shouldAutoOpenPickerOnce") private var shouldAutoOpenPickerOnce = false
 
-    // UI state
+    // Sheets
     @State private var showLibrary = false
     @State private var showSettings = false
 
     var body: some View {
         NavigationStack {
             ZStack {
-                // BRAND BACKGROUND (uses the three brand colors from Theme.swift via hex init there)
+                // BRAND BACKGROUND
                 LinearGradient(
                     colors: [
                         BrandColor.peach.opacity(0.9),
@@ -38,197 +37,43 @@ struct HomeView: View {
 
                 ScrollView {
                     VStack(spacing: 18) {
-                        // Greeting / title
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Cutaway")
-                                .font(.system(size: 34, weight: .heavy, design: .rounded))
-                                .foregroundStyle(.white)
-                            Text("Multi‑perspective mini‑episodes")
-                                .font(.subheadline).foregroundStyle(.white.opacity(0.85))
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 18)
-                        .padding(.top, 8)
+                        HeaderTitle()
 
-                        // ===== MAIN CLIP CARD =====
-                        Card {
-                            if let url = vm.mainClipURL {
-                                // Compact summary when selected
-                                HStack(alignment: .center, spacing: 14) {
-                                    ZStack {
-                                        RoundedRectangle(cornerRadius: 10)
-                                            .fill(.white.opacity(0.08))
-                                            .frame(width: 96, height: 56)
-                                        VideoThumbView(url: url)
-                                            .frame(width: 96, height: 56)
-                                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                                    }
+                        MainClipCard(
+                            mainURL: vm.mainClipURL,
+                            filename: vm.mainFilename,
+                            duration: vm.mainDurationSec,
+                            onPick: { vm.showingPicker = true }
+                        )
 
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(vm.mainFilename ?? url.lastPathComponent)
-                                            .font(.headline)
-                                            .lineLimit(1)
-                                            .truncationMode(.tail)
-                                            .layoutPriority(1)
+                        ReactionsCard(
+                            reactions: vm.reactions,
+                            onRecord: { vm.showingRecord = true },
+                            onRename: { renameReaction($0) },
+                            onClear: { vm.clearAll() }
+                        )
 
-                                        if let d = vm.mainDurationSec {
-                                            Text(String(format: "%.1fs", d))
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                    }
-                                    Spacer(minLength: 8)
-
-                                    Button {
-                                        vm.showingPicker = true
-                                    } label: {
-                                        Label("Change", systemImage: "square.and.pencil")
-                                            .labelStyle(.titleAndIcon)
-                                    }
-                                    .buttonStyle(.bordered)
-                                }
-                            } else {
-                                // Spacious empty state with a BIG primary CTA
-                                VStack(alignment: .leading, spacing: 12) {
-                                    HStack(spacing: 10) {
-                                        Image(systemName: "film")
-                                            .font(.system(size: 22, weight: .semibold))
-                                        Text("Add your main clip")
-                                            .font(.headline)
-                                    }
-
-                                    Text("Pick a video from Photos to be the foundation of your episode.")
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-
-                                    Button {
-                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                        vm.showingPicker = true
-                                    } label: {
-                                        Label("Pick from Photos", systemImage: "photo.on.rectangle")
-                                            .font(.headline)
-                                            .frame(maxWidth: .infinity)
-                                            .padding(.vertical, 12)
-                                    }
-                                    .buttonStyle(GradientButtonStyle()) // from Theme.swift
-                                }
-                            }
-                        }
-
-                        // ===== REACTIONS CARD =====
-                        Card {
-                            VStack(alignment: .leading, spacing: 10) {
-                                HStack {
-                                    Image(systemName: "person.line.dotted.person.fill")
-                                        .foregroundStyle(.white)
-                                    Text("Reactions")
-                                        .font(.headline)
-                                }
-
-                                if vm.reactions.isEmpty {
-                                    Text("Record 1–3 front‑camera reactions.")
-                                        .foregroundStyle(.secondary)
-                                        .transition(.opacity)
+                        // ✅ Preview CTA lives here (only once)
+                        PreviewCTA(
+                            enabled: vm.isReadyForPreview,
+                            onOpen: {
+                                UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+                                if vm.isReadyForPreview {
+                                    goPreview = true
                                 } else {
-                                    FlowRow(spacing: 8) {
-                                        ForEach(vm.reactions) { r in
-                                            Text(r.displayName.isEmpty ? "Guest" : r.displayName)
-                                                .padding(.horizontal, 12)
-                                                .padding(.vertical, 6)
-                                                .background(.ultraThinMaterial)
-                                                .clipShape(Capsule())
-                                                .contextMenu {
-                                                    Button("Rename") { renameReaction(r) }
-                                                    Button(role: .destructive) {
-                                                        vm.removeReaction(id: r.id)
-                                                    } label: {
-                                                        Label("Delete", systemImage: "trash")
-                                                    }
-                                                }
-                                                .transition(.move(edge: .bottom).combined(with: .opacity))
-                                        }
-                                    }
+                                    UINotificationFeedbackGenerator().notificationOccurred(.warning)
                                 }
-
-                                HStack(spacing: 10) {
-                                    Button {
-                                        vm.showingRecord = true
-                                        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-                                    } label: {
-                                        Label("Record Reaction", systemImage: "camera.fill")
-                                    }
-                                    .buttonStyle(.borderedProminent)
-                                    .tint(BrandColor.lavender)
-
-                                    if !vm.reactions.isEmpty {
-                                        Button(role: .destructive) {
-                                            vm.clearAll()
-                                        } label: {
-                                            Label("Clear", systemImage: "trash")
-                                        }
-                                        .buttonStyle(.bordered)
-                                    }
-                                }
-                                .padding(.top, 2)
                             }
-                        }
-
-                        // ===== PREVIEW / CTA CARD =====
-                        Card {
-                            VStack(alignment: .leading, spacing: 10) {
-                                HStack {
-                                    Image(systemName: "play.rectangle.fill")
-                                        .foregroundStyle(.white)
-                                    Text("Preview & Export")
-                                        .font(.headline)
-                                }
-                                Text("We’ll auto‑stitch main ↔ reactions. You can fine‑tune rhythm & add bleeps next.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-
-                                Button {
-                                    UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
-                                    if vm.isReadyForPreview {
-                                        goPreview = true
-                                    } else {
-                                        UINotificationFeedbackGenerator().notificationOccurred(.warning)
-                                    }
-                                } label: {
-                                    Label("Open Preview", systemImage: "sparkles")
-                                        .font(.headline)
-                                }
-                                .buttonStyle(GradientButtonStyle()) // from Theme.swift
-                                .disabled(!vm.isReadyForPreview)
-                            }
-                            // Hidden NavigationLink that actually drives the push
-                            .background(
-                                NavigationLink(
-                                    destination: {
-                                        if let pvm = vm.makePreviewViewModel(library: library) {
-                                            PreviewView(viewModel: pvm)
-                                        } else {
-                                            Text("Missing media").font(.headline)
-                                        }
-                                    },
-                                    isActive: $goPreview,
-                                    label: { EmptyView() }
-                                )
-                                .opacity(0)
-                            )
-                        }
+                        )
                     }
                     .padding(.bottom, 24)
                 }
             }
-            .navigationTitle("") // large custom title
+            .navigationTitle("")
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button { showLibrary = true } label: {
-                        Image(systemName: "sparkles.tv")
-                    }
-                    Button { showSettings = true } label: {
-                        Image(systemName: "gearshape")
-                    }
+                    Button { showLibrary = true } label: { Image(systemName: "sparkles.tv") }
+                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
                 }
             }
             // Sheets
@@ -240,9 +85,7 @@ struct HomeView: View {
                 .ignoresSafeArea()
             }
             .sheet(isPresented: $vm.showingRecord) {
-                ReactionRecordView { url in
-                    vm.addReaction(url: url, displayName: "Me")
-                }
+                ReactionRecordView { url in vm.addReaction(url: url, displayName: "Me") }
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView().environmentObject(library)
@@ -250,13 +93,20 @@ struct HomeView: View {
             .navigationDestination(isPresented: $showLibrary) {
                 LibraryView().environmentObject(library)
             }
+            // ✅ Drive preview nav from here
+            .navigationDestination(isPresented: $goPreview) {
+                if let pvm = vm.makePreviewViewModel(library: library) {
+                    PreviewView(viewModel: pvm)
+                } else {
+                    Text("Missing media").font(.headline)
+                }
+            }
             // Auto‑open picker when Intro’s “Start New Episode” triggers
             .onReceive(NotificationCenter.default.publisher(for: .CutawayOpenPicker)) { _ in
                 vm.showingPicker = true
             }
         }
         .onAppear {
-            // Smooth Intro → Home → Picker handoff
             if shouldAutoOpenPickerOnce {
                 shouldAutoOpenPickerOnce = false
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
@@ -280,7 +130,150 @@ struct HomeView: View {
     }
 }
 
-// MARK: - Styled Components (simple card for consistency with theme)
+// MARK: - Sections
+
+private struct HeaderTitle: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Cutaway")
+                .font(.system(size: 34, weight: .heavy, design: .rounded))
+                .foregroundStyle(.white)
+            Text("Multi‑perspective mini‑episodes")
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.85))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 18)
+        .padding(.top, 8)
+    }
+}
+
+private struct MainClipCard: View {
+    let mainURL: URL?
+    let filename: String?
+    let duration: Double?
+    let onPick: () -> Void
+
+    var body: some View {
+        Card {
+            if let url = mainURL {
+                HStack(alignment: .center, spacing: 14) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(.white.opacity(0.08))
+                            .frame(width: 96, height: 56)
+                        VideoThumbView(url: url)
+                            .frame(width: 96, height: 56)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(filename ?? url.lastPathComponent)
+                            .font(.headline)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .layoutPriority(1)
+                        if let d = duration {
+                            Text(String(format: "%.1fs", d))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer(minLength: 8)
+
+                    Button(action: onPick) {
+                        Label("Change", systemImage: "square.and.pencil")
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "film")
+                            .font(.system(size: 22, weight: .semibold))
+                        Text("Add your main clip")
+                            .font(.headline)
+                    }
+                    Text("Pick a video from Photos to be the foundation of your episode.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+
+                    Button(action: onPick) {
+                        Label("Pick from Photos", systemImage: "photo.on.rectangle")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                    }
+                    .buttonStyle(GradientButtonStyle()) // from Theme.swift
+                }
+            }
+        }
+    }
+}
+
+private struct ReactionsCard: View {
+    let reactions: [ReactionClip]
+    let onRecord: () -> Void
+    let onRename: (ReactionClip) -> Void
+    let onClear: () -> Void
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Image(systemName: "person.line.dotted.person.fill")
+                        .foregroundStyle(.white)
+                    Text("Reactions")
+                        .font(.headline)
+                }
+
+                if reactions.isEmpty {
+                    Text("Record 1–3 front‑camera reactions.")
+                        .foregroundStyle(.secondary)
+                        .transition(.opacity)
+                } else {
+                    FlowRow(spacing: 8) {
+                        ForEach(reactions) { r in
+                            Text(r.displayName.isEmpty ? "Guest" : r.displayName)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(.ultraThinMaterial)
+                                .clipShape(Capsule())
+                                .contextMenu {
+                                    Button("Rename") { onRename(r) }
+                                    Button(role: .destructive) {
+                                        onClear() // keep as "clear all" per your note
+                                    } label: {
+                                        Label("Delete All", systemImage: "trash")
+                                    }
+                                }
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    Button(action: onRecord) {
+                        Label("Record Reaction", systemImage: "camera.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(BrandColor.lavender)
+
+                    if !reactions.isEmpty {
+                        Button(role: .destructive, action: onClear) {
+                            Label("Clear", systemImage: "trash")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+    }
+}
+
+// MARK: - Reusable Pieces
 
 private struct Card<Content: View>: View {
     @ViewBuilder var content: Content
@@ -300,7 +293,6 @@ private struct Card<Content: View>: View {
     }
 }
 
-// Simple flow layout for reaction chips
 private struct FlowRow<Content: View>: View {
     let spacing: CGFloat
     @ViewBuilder var content: Content
@@ -326,7 +318,6 @@ private struct FlowRow<Content: View>: View {
     }
 }
 
-// Thumbnail from local file
 private struct VideoThumbView: View {
     let url: URL
     @State private var image: UIImage?
@@ -340,9 +331,7 @@ private struct VideoThumbView: View {
                     .overlay(ProgressView().tint(.white.opacity(0.8)))
             }
         }
-        .task {
-            image = try? await generateThumb(url: url, at: 1.0)
-        }
+        .task { image = try? await generateThumb(url: url, at: 1.0) }
         .clipped()
     }
 
@@ -351,12 +340,16 @@ private struct VideoThumbView: View {
         let gen = AVAssetImageGenerator(asset: asset)
         gen.appliesPreferredTrackTransform = true
         gen.maximumSize = CGSize(width: 640, height: 360)
-        let cg = try gen.copyCGImage(at: CMTime(seconds: seconds, preferredTimescale: 600), actualTime: nil)
+        let cg = try gen.copyCGImage(
+            at: CMTime(seconds: seconds, preferredTimescale: 600),
+            actualTime: nil
+        )
         return UIImage(cgImage: cg)
     }
 }
 
-// Tiny UIKit presenter for rename
+// MARK: - Tiny UIKit helper
+
 private extension UIApplication {
     func present(alert: UIAlertController) {
         guard let scene = connectedScenes.first as? UIWindowScene,
